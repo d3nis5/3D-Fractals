@@ -1,0 +1,438 @@
+#version 430
+
+/**
+ * PGP, GMU Projekt - Visualization of 3D fractals
+ * VUT FIT, 2020/2021
+ *
+ * Autor:	Denis Leitner, xleitn02
+ * Subor:	compShader.comp
+ *
+ */
+
+
+#define FAR_PLANE 15.0f		// far plane distance
+#define NEAR_PLANE 0.0f		// near plane distance
+
+#define PI2 6.28318531
+
+layout (local_size_x = 16, local_size_y = 16) in;
+layout (rgba32f, binding = 0) uniform image2D imgOutput;
+layout (rgba32f, binding = 1) uniform image2D accumulationBuffer;
+
+// colors
+//const vec3 colDarkSalmon = vec3(0.914, 0.588, 0.478);
+//const vec3 colDarkRed = vec3(0.545, 0, 0);
+const vec3 colDarkOliveGreen = vec3(0.334, 0.42, 0.184);
+const vec3 colDarkKhaki = vec3(0.741, 0.718, 0.42); 
+//const vec3 colDarkSeaGreen = vec3(0.56, 0.737, 0.56);
+//const vec3 colDarkGreen = vec3(0, 0.645, 0);
+//const vec3 colForestGreen = vec3(0.134, 0.545, 0.134);
+//const vec3 colLightGreen = vec3(0.565, 0.934, 0.565);
+const vec3 colBrown = vec3(0.58, 0.313, 0.0);
+
+// rendering uniforms
+uniform float MinDist = 0.0001;
+uniform int MaxMarchingSteps = 80;
+uniform float DetailPower = 1.5;
+uniform bool Shadows = false;
+uniform float ShadowSoftness = 16.0;
+uniform vec2 SubframeOffset = vec2(0.5);
+uniform int SubframeID = 0;
+
+// fractal uniforms
+uniform float Power = 8.0f;
+uniform int Iterations = 4;
+
+// camera uniforms
+uniform vec3 Origin;
+uniform mat4 ViewMatrix;
+
+// coloring uniforms
+uniform vec3 BgColor = vec3(0.53, 0.8, 0.8);
+uniform vec3 FractalColor = colDarkOliveGreen;
+uniform vec3 O_TrapColor = colDarkKhaki;
+uniform vec3 Y_TrapColor = colBrown;
+
+// light uniforms
+uniform vec3 Light = normalize(vec3(0.0, 1.4, 1.7));
+
+// Vfov = tan(radians(fieldOfView) / 2.0)
+uniform float Vfov;
+
+const vec3 ambientLight = vec3(0.1);
+const vec3 lightIntensity = vec3(1.0);
+
+struct Sphere
+{
+	vec3 center;
+	float radius;
+};
+
+struct Ray
+{
+	vec3 origin;
+	vec3 dir;
+};
+
+
+float intersectSDF(float distA, float distB) 
+{
+    return max(distA, distB);
+}
+
+float unionSDF(float distA, float distB) 
+{
+    return min(distA, distB);
+}
+
+float smoothUnionSDF(float distA, float distB, float k ) 
+{
+    float h = clamp( 0.5 + 0.5*(distB-distA)/k, 0.0, 1.0 );
+    return mix( distB, distA, h ) - k*h*(1.0-h); 
+}
+
+float differenceSDF(float distA, float distB) 
+{
+    return max(distA, -distB);
+}
+
+float sphereSDF(Sphere sphere, vec3 point)
+{
+	return length(point - sphere.center) - sphere.radius;
+}
+
+float groundSDF(vec3 point)
+{
+	return point.y+1;// + 0.3*sin(mod(point.x,PI2))*cos(mod(point.z,PI2));
+}
+
+float boxSDF(vec3 b, vec3 point)
+{
+	vec3 q = abs(point) - b;
+	return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);
+}
+
+// http://www.fractalforums.com/3d-fractal-generation/kaleidoscopic-%28escape-time-ifs%29/
+float sierpinski3(vec3 point, out vec4 trap)
+{
+	const vec3 offset = vec3(1.0);
+	const float scale = 2.0;
+	vec3 w = point;
+	
+	float m = dot(w,w);
+
+	trap = vec4(abs(w), m);
+	
+	int n = 0;
+	while (n < Iterations) 
+	{
+		//z *= fracRotation1;
+		
+		if(w.x+w.y<0.0) w.xy = -w.yx;
+		if(w.x+w.z<0.0) w.xz = -w.zx;
+		if(w.y+w.z<0.0) w.zy = -w.yz;
+		
+		w = w*scale - offset*(scale-1.0);
+		//z *= fracRotation2;
+		
+		trap = min(trap, vec4(abs(w), m));
+
+		m = dot(w, w);
+		n++;
+	}
+	
+	return (length(w)) * pow(scale, -float(n));
+}
+
+// Credit to https://www.iquilezles.org/www/articles/mandelbulb/mandelbulb.htm
+float mandelbulbSDF(vec3 p, out vec4 trap)
+{
+    vec3 w = p;
+    float m = dot(w,w);
+
+	trap = vec4(abs(w), m);
+
+	float dz = 1.0;
+    
+	for (int i=0; i<Iterations; i++)
+    {
+        dz = Power*pow(sqrt(m),Power-1.0)*dz + 1.0;
+		//dz = 8.0*pow(m,3.5)*dz + 1.0;
+        
+        float r = length(w);
+        float b = Power*acos( w.y/r);
+        float a = Power*atan( w.x, w.z );
+        w = p + pow(r,Power) * vec3( sin(b)*sin(a), cos(b), sin(b)*cos(a) );
+
+		trap = min(trap, vec4(abs(w), m));
+
+        m = dot(w,w);
+		if( m > 256.0 )
+            break;
+    }
+
+	trap = vec4(m, trap.yzw);
+
+    return 0.25*log(m)*sqrt(m)/dz;
+}
+
+float mengerSDF(vec3 z)
+{
+	const vec3 Offset = vec3(1);
+	const float Scale = 3.0;
+
+	int n = 0;
+	while (n < Iterations) {
+		z = abs(z);
+		if (z.x<z.y){ z.xy = z.yx;}
+		if (z.x< z.z){ z.xz = z.zx;}
+		if (z.y<z.z){ z.yz = z.zy;}
+		z = Scale*z-Offset*(Scale-1.0);
+		if( z.z<-0.5*Offset.z*(Scale-1.0))  z.z+=Offset.z*(Scale-1.0);
+		n++;
+	}
+	
+	return abs(length(z)-0.0 ) * pow(Scale, float(-n));
+}
+
+float sceneSDF(vec3 point, out vec4 color)
+{
+	return mandelbulbSDF(point, color);
+}
+
+vec3 estimateNormal(vec3 p, float dist, float epsilon) {
+	vec3 n;
+	vec4 dummy;
+	n.x = sceneSDF(p + vec3(epsilon, 0.0, 0.0), dummy).x - dist;
+	n.z = sceneSDF(p + vec3(0.0, 0.0, epsilon), dummy).x - dist;
+	n.y = sceneSDF(p + vec3(0.0, epsilon, 0.0), dummy).x - dist;
+	return normalize(n);
+}
+
+float softShadow(vec3 point, float epsilon)
+{
+	vec4 dummy;
+	Ray r;
+	r.dir = Light;
+	r.origin = point + r.dir*0.1;
+
+	float res = 1.0;
+	float depth = NEAR_PLANE;
+
+	int maxIterations = MaxMarchingSteps / 2;
+
+	for (int i = 0; i < maxIterations; i++) 
+	{
+		vec3 samplePoint = r.origin + depth * r.dir;
+		float dist = sceneSDF(samplePoint, dummy);
+		if (dist < epsilon) 
+		{
+			// Point is in full shadow
+			return 0.0;
+		}
+		res = min(res, ShadowSoftness*dist/depth);
+
+		// Move along the shadow ray
+		depth += dist;
+
+		if (depth >= FAR_PLANE) {
+			// Ray reached far plane
+			break;
+		}
+	}
+	return res;
+}
+
+// Credit to https://thebookofshaders.com/10/
+float random(vec2 st) 
+{
+    return fract(sin(dot(st.xy, vec2(12.9898,78.233)))* 43758.5453123);
+}
+
+// @brief Ambient occlusion approximation
+// Samples proximity in a few points along a normal with origin in given point
+// Credit to https://github.com/3Dickulus/Fragmentarium_Examples_Folder/blob/b6da79fc9ac346d0a7197b16f323e4759f3c68a6/Include/DE-Raytracer.frag
+float ambientOcclusion(vec3 p, vec3 n, float epsilon) 
+{
+	vec4 dummy = vec4(0);
+	float ao = 0.0;
+	float wSum = 0.0;
+	float de = sceneSDF(p, dummy);
+	float w = 1.0;
+	float d = 1.0-random(p.xy);
+	for (float i =1.0; i <6.0; i++) 
+	{
+		float D = (sceneSDF(p+ d*n*i*i*epsilon, dummy) -de)/(d*i*i*epsilon);
+		w *= 0.6;
+		ao += w*clamp(1.0-D,0.0,1.0);
+		wSum += w;
+	}
+	return clamp(ao/wSum, 0.0, 1.0);
+}
+
+vec3 shade(vec3 point, vec3 viewDirection, vec3 color, float dist, float epsilon)
+{
+	// normal vector of a given surface point
+	vec3 N = estimateNormal(point, dist, epsilon);
+
+	// specular exponent
+	const float n = 10.0;
+	// specular component
+	const float Ks = 0.08f;
+
+	// compute diffuse component
+	vec3 diffuse = color * lightIntensity * max(0.0f, dot(Light, N));
+
+	// reflected light vector
+	vec3 R = reflect(-Light, N);
+
+	// compute specular component
+	vec3 specular =  vec3(pow(max(0.0f, dot(-viewDirection, R)), n));
+
+	vec3 result;
+	vec3 ambientColor = color * ambientLight;
+
+	if (Shadows)
+		result = ambientColor + softShadow(point, epsilon) * (lightIntensity * (diffuse + Ks * specular));
+	else
+		result = ambientColor + lightIntensity * (diffuse + Ks * specular);
+
+	result *= ambientOcclusion(point, N, epsilon);
+
+	return clamp(result, 0.0, 1.0);
+}
+
+vec3 applyFog(vec3 color, float depth)
+{
+	const vec3 fogColor = vec3(.7);
+	depth -= 10;	// increases fog distance
+	depth = clamp(depth, NEAR_PLANE, FAR_PLANE);
+	return mix( color, fogColor, 1.0-exp( -0.0001*depth*depth*depth ) );
+}
+
+
+// @brief Returns direction of a ray going through given pixel
+vec3 rayDirection(vec2 size, vec2 pixelCoord) {
+    vec2 xy = pixelCoord - size / 2.0;
+    float z = size.y / Vfov;
+    return normalize(vec3(xy, -z));
+}
+
+vec3 trace(Ray r, out float intersectionDistance, out float lastDistanceEstimation, out int totalSteps)
+{
+	// background color
+	vec3 color = BgColor;
+
+	float totalDist = NEAR_PLANE;
+	int steps = 0;
+
+	float epsilon = MinDist;
+	float epsilonModified = MinDist;		// SDF minimal distance based on zoom level
+
+	// bounding sphere
+	const Sphere s = Sphere(vec3(0.0, 0.0, 0.0), 1.2);
+	float boundingSphere = sphereSDF(s, r.origin);
+
+	if (boundingSphere > 0.0)
+	{
+		totalDist += boundingSphere;
+	}
+
+	vec4 trap;
+	vec3 col;
+
+	for (steps = 0; steps < MaxMarchingSteps; steps++) 
+	{
+		vec3 samplePoint = r.origin + totalDist * r.dir;
+		float dist = sceneSDF(samplePoint, trap);
+
+		// Move along the view ray
+		totalDist += dist;
+
+		epsilonModified = clamp(epsilon * pow(totalDist, DetailPower), MinDist, FAR_PLANE);
+
+		if (dist < epsilonModified) 
+		{
+			// Ray is inside the scene surface
+			totalDist -= (epsilonModified - dist);
+
+			col = FractalColor;
+			col = mix( col, Y_TrapColor, clamp(trap.y,0.0,1.0) );
+	 		//col = mix( col, blue, clamp(trap.z*trap.z,0.0,1.0) );
+			col = mix( col, O_TrapColor, clamp(pow(trap.w, 8),0.0,1.0) );
+			col *= 0.5;
+			
+			color = col;
+			intersectionDistance = totalDist;
+			lastDistanceEstimation = dist;
+			totalSteps = steps;
+			break;
+
+			/*color = shade(samplePoint, r.dir, col, dist, epsilonModified);
+
+			// ambient occlusion based on number of marching steps
+			color *= vec3(1-float(steps)/float(MaxMarchingSteps));
+
+			break;*/
+		}
+
+		if (totalDist >= FAR_PLANE) {
+			// Ray reached far plane
+			intersectionDistance = -1.0;
+			break;
+		}
+	}
+
+	if (steps == MaxMarchingSteps) 
+	{
+		intersectionDistance = -1.0;
+		color = vec3(0.0);
+	}
+
+	//color +=  vec3(float(steps)/float(MaxMarchingSteps)); //glow
+
+	return color;
+}
+
+void main()
+{
+	ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 dimensions = imageSize(imgOutput); // fetch image dimensions
+
+	if (pixelCoords.x > dimensions.x || pixelCoords.y > dimensions.y)
+		return;
+
+	vec3 direction = rayDirection(dimensions, pixelCoords + SubframeOffset);
+
+	direction = (ViewMatrix * vec4(direction, 0.0)).xyz;
+	Ray r = Ray(Origin, direction);
+
+	float intersectionDistance = 0.0;
+	float lastDistanceEstimation = 0.0;
+	int totalSteps = 0;
+	vec3 color = trace(r, intersectionDistance, lastDistanceEstimation, totalSteps);
+
+	if (intersectionDistance > 0.0)
+	{
+		vec3 samplePoint = r.origin + (intersectionDistance-lastDistanceEstimation) * r.dir;
+		float epsilonModified = clamp(MinDist * pow(intersectionDistance, DetailPower), MinDist, FAR_PLANE);
+		color = shade(samplePoint, r.dir, color, lastDistanceEstimation, epsilonModified);
+
+		// ambient occlusion based on number of marching steps
+		color *= vec3(1-float(totalSteps)/float(MaxMarchingSteps));
+	}
+
+	color = sqrt(color);
+
+	vec3 newAccumulator = color;
+
+	if (SubframeID != 0)
+	{
+		vec3 accumulator = imageLoad(accumulationBuffer, pixelCoords).xyz;
+		newAccumulator = accumulator + color;
+		color = newAccumulator / (SubframeID + 1);
+	}
+
+	imageStore(imgOutput, pixelCoords, vec4(color, 1.0));
+	imageStore(accumulationBuffer, pixelCoords, vec4(newAccumulator, 1.0));
+}
