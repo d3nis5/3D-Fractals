@@ -15,7 +15,7 @@ Application for 3D fractal visualization. Fractal is defined by procedural funct
 - OpenGL 4.3 or higher
 
 ## Dependencies
-- [glad](https://github.com/Dav1dde/glad)
+- [glad](https://github.com/Dav1dde/glad) (included in this repository)
 - [GLFW](https://github.com/glfw/glfw) (v3.2)
 - [GLM](https://github.com/g-truc/glm) (v0.9.9.8)
 - [Dear ImGui](https://github.com/ocornut/imgui) (v1.80)
