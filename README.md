@@ -1,5 +1,5 @@
 # Visualization of 3D Fractals
-Application for 3D fractal visualization. Fractal is defined by procedural function which is rendered by raymarching in OpenGL compute shader. Parameters of the fractal and rendering can be changed in GUI.
+Application for the visualization of 3D fractal. Fractal is defined as procedural function that is rendered with raymarching in OpenGL compute shader. Parameters of the fractal and rendering can be changed in GUI.
 
 ![Screenshot](https://github.com/d3nis5/3D-Fractals/blob/main/screenshot.jpg)
 
